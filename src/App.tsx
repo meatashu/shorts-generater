@@ -4,6 +4,7 @@ import type { GenerationOptions } from './services/ollama';
 import { saveInteraction, getCachedInteraction } from './services/db';
 import { Play, Square, Sparkles, Loader2, Settings as SettingsIcon, RotateCw, Download, Video, Bug, Code, DollarSign, Heart, Lightbulb, Smile, Frown, Monitor, Database as DatabaseIcon, Zap, Music, Image as ImageIcon } from 'lucide-react';
 import { motion } from 'framer-motion';
+import html2canvas from 'html2canvas';
 import SettingsModal from './components/SettingsModal';
 import './index.css';
 
@@ -25,6 +26,7 @@ function App() {
   const [isRecording, setIsRecording] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
+  const frameRequestRef = useRef<number>(0);
 
   const activeWordRef = useRef<HTMLSpanElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -146,38 +148,33 @@ function App() {
   };
 
   const handleGenerateVideo = async () => {
-    // 0. Check support
-    if (!navigator.mediaDevices?.getDisplayMedia) {
-      alert("Your browser does not support screen recording. Please try Chrome or Edge.");
-      return;
-    }
+    if (!script || !scrollContainerRef.current) return;
 
     try {
-      // 1. Alert user (optional, but keep it brief or remove if annoying)
-      // Safari requires direct user gesture. Alert is sync, so it's okay, 
-      // but let's just confirm with them if they want to proceed to avoid confusion.
-      if (!confirm("Ready to generate? \n\nIMPORTANT: Select THIS tab and ensure 'Share Audio' is checked.")) {
-        return;
-      }
+      setIsRecording(true);
 
-      // 2. Acquire stream IMMEDIATELY to satisfy "user gesture" requirement
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { displaySurface: "browser" },
-        audio: true
-      });
+      // 1. Setup Canvas for Recording
+      // We will capture the DOM element repeatedly
+      const targetEl = scrollContainerRef.current;
+      const { width, height } = targetEl.getBoundingClientRect();
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
 
-      // 3. NOW we can modify the UI since we have the stream
-      document.body.classList.add('recording-mode');
+      if (!ctx) throw new Error("Could not get canvas context");
 
-      // Determine supported mime type
+      // 2. Setup Stream from Canvas
+      const stream = canvas.captureStream(30); // 30 FPS
+
+      // Select MIME type (Safari supports mp4, Chrome needs webm usually)
       const mimeTypes = [
-        'video/webm;codecs=vp9',
-        'video/webm',
-        'video/mp4'
+        'video/mp4',
+        'video/webm;codecs=h264',
+        'video/webm'
       ];
       const mimeType = mimeTypes.find(t => MediaRecorder.isTypeSupported(t)) || '';
-
-      console.log("Using MIME type:", mimeType || "default");
+      console.log("Internal Recording MIME:", mimeType);
 
       const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
       mediaRecorderRef.current = recorder;
@@ -190,11 +187,7 @@ function App() {
       };
 
       recorder.onstop = () => {
-        document.body.classList.remove('recording-mode'); // Restore view
-
-        // Default extension based on type
         const ext = (mimeType && mimeType.includes('mp4')) ? 'mp4' : 'webm';
-
         const blob = new Blob(recordedChunksRef.current, { type: mimeType || 'video/webm' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -205,29 +198,51 @@ function App() {
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
 
-        stream.getTracks().forEach(track => track.stop());
         setIsRecording(false);
+        cancelAnimationFrame(frameRequestRef.current);
       };
 
-      // Slight delay to allow CSS transition to finish before recording starts
-      await new Promise(r => setTimeout(r, 500));
-
       recorder.start();
-      setIsRecording(true);
-      handlePlay();
+      handlePlay(); // Start audio/animation
+
+      // 3. Render Loop (The "Internal" conversion)
+      const renderFrame = async () => {
+        if (!setIsRecording) return; // check state? (closure stale, use ref if needed or rely on stop)
+
+        // Use html2canvas to snap the DOM
+        try {
+          // We use a lighter config for speed if possible
+          const frame = await html2canvas(targetEl, {
+            backgroundColor: '#000000',
+            scale: 1, // Retain 1:1 scale for performance
+            logging: false,
+            useCORS: true
+          });
+
+          ctx.drawImage(frame, 0, 0, width, height);
+
+          if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+            frameRequestRef.current = requestAnimationFrame(renderFrame);
+          }
+        } catch (e) {
+          console.error("Frame capture error", e);
+        }
+      };
+
+      renderFrame();
 
     } catch (e) {
-      console.error("Recording failed", e);
-      document.body.classList.remove('recording-mode');
+      console.error("Video Generation failed", e);
       setIsRecording(false);
-      alert("Could not start recording. " + (e instanceof Error ? e.message : String(e)));
+      alert("Conversion failed. " + String(e));
     }
   };
 
-  // Hook into playback end to stop recording if active
+  // Stop recorder when playback ends
   useEffect(() => {
     if (!isPlaying && isRecording && mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.stop();
+      cancelAnimationFrame(frameRequestRef.current);
     }
   }, [isPlaying, isRecording]);
 
